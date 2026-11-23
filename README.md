@@ -6,7 +6,7 @@ This is the connector extracted from a production ComfyUI workstation. It exists
 
 ## Features
 
-- **Process control**: `comfyui_status`, `comfyui_restart`, `comfyui_stop` with detached startup and port-release verification.
+- **Process control**: `comfyui_status`, `comfyui_restart`, `comfyui_stop` with hidden-console startup, optional VS 2022 x64 developer environment, optional UAC elevation, and port-release verification.
 - **Headless workflows**: `submit_workflow` with blocking or non-blocking mode, plus `comfyui_job_status` and `comfyui_wait_job` for long video jobs.
 - **Complete output parsing**: images (`SaveImage`), videos (`VHS_VideoCombine`, `SaveVideo`) and audio are all reported.
 - **Model and node discovery**: `list_models` and `get_object_info` so agents can build valid API-format workflows.
@@ -18,7 +18,7 @@ This is the connector extracted from a production ComfyUI workstation. It exists
 - Python 3.10+
 - A ComfyUI checkout with its virtual environment
 - `mcp` installed in that environment (`pip install mcp` if missing)
-- Windows, Linux or macOS (restart uses Windows `DETACHED_PROCESS`; POSIX uses `start_new_session`)
+- Windows, Linux or macOS (Windows uses a hidden console and `vcvars64.bat` when present; POSIX uses `start_new_session`)
 
 ## Quick start
 
@@ -59,6 +59,8 @@ Qoder / WorkBuddy / Cursor style `mcp.json`:
 | `COMFYUI_PORT` | no | auto `8188-8190` | Preferred port; auto-detection verifies `/system_stats` |
 | `COMFYUI_START_ARGS` | no | `--port <port>` | Arguments passed to `main.py` on restart |
 | `COMFYUI_PYTHON` | no | `<COMFYUI_DIR>/.venv` python | Interpreter used by `execute_python` |
+| `COMFYUI_VSDEV` | no | on | Load the VS 2022 x64 developer environment via `vcvars64.bat` before `main.py` |
+| `COMFYUI_ADMIN` | no | off | Start ComfyUI elevated; Windows shows a UAC prompt |
 
 ## Tools
 
@@ -67,8 +69,8 @@ Qoder / WorkBuddy / Cursor style `mcp.json`:
 | `execute_python` | Run Python with the ComfyUI interpreter in `COMFYUI_DIR` |
 | `execute_shell` | Run a shell command with the venv `Scripts`/`bin` directory on `PATH` |
 | `comfyui_status` | Port, version, Python/PyTorch, devices, queue depth |
-| `comfyui_restart` | Stop then start ComfyUI as a detached process, return immediately |
-| `comfyui_stop` | Kill the ComfyUI process tree and verify ports are released |
+| `comfyui_restart` | Stop then start ComfyUI in a hidden console, return immediately |
+| `comfyui_stop` | Kill the ComfyUI process tree and verify ports are released; an elevated instance is stopped through UAC |
 | `submit_workflow` | POST an API-format workflow; optionally wait for completion |
 | `comfyui_job_status` | One-shot job state and output files |
 | `comfyui_wait_job` | Block until a job completes or times out |
@@ -89,6 +91,8 @@ comfyui_wait_job(prompt_id=..., timeout=600)
 ## Notes
 
 - Restart logs go to `<COMFYUI_DIR>/comfyui_runner.log`.
+- `COMFYUI_VSDEV` locates `vcvars64.bat` through `VSINSTALLDIR`, `vswhere.exe`, then the standard VS 2022 install folders. If none is found, ComfyUI starts without the developer environment.
+- `COMFYUI_ADMIN` launches `cmd.exe` through `ShellExecuteEx(runas)`, so Windows shows a UAC prompt. UAC must also be approved for `comfyui_stop`/`comfyui_restart` to terminate that instance. The launch PID is recorded in `<COMFYUI_DIR>/user/comfyui_runner.launch.json` because elevated command lines are not readable from a normal process.
 - Auto-detection probes `8188`, `8189` and `8190` and only accepts a port that answers `/system_stats`.
 - The server never downloads models and makes no outbound internet requests. It only talks to the configured local ComfyUI instance.
 - `execute_shell` and `execute_python` are powerful by design. Run the server only for clients you trust.

@@ -11,6 +11,8 @@ Environment variables:
     COMFYUI_PORT        Preferred port (default: auto-detect 8188-8190)
     COMFYUI_START_ARGS  Extra ``main.py`` arguments used on restart
     COMFYUI_PYTHON      Interpreter used by execute_python (default: venv python)
+    COMFYUI_VSDEV       Initialize the VS 2022 x64 developer environment (default: on)
+    COMFYUI_ADMIN       Start ComfyUI elevated via UAC (default: off)
 
 Run:
     python server.py
@@ -19,6 +21,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import shlex
@@ -35,12 +38,158 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 DEFAULT_PORTS = (8188, 8189, 8190)
 MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf"}
 OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".gif", ".wav", ".mp3", ".flac"}
 
-server = Server("comfyui-runner")
+server = Server("comfyui-runner", version=SERVER_VERSION)
+
+STILL_ACTIVE = 259
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+ERROR_CANCELLED = 1223
+WAIT_TIMEOUT = 0x102
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _find_vcvars64() -> Path | None:
+    if os.name != "nt":
+        return None
+    env_dir = os.environ.get("VSINSTALLDIR", "").strip()
+    if env_dir:
+        candidate = Path(env_dir) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        if candidate.is_file():
+            return candidate
+
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        try:
+            found = subprocess.run(
+                [
+                    str(vswhere),
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            found = None
+        if found is not None and found.returncode == 0:
+            for line in found.stdout.splitlines():
+                install = line.strip()
+                if not install:
+                    continue
+                candidate = Path(install) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if candidate.is_file():
+                    return candidate
+
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if not base:
+            continue
+        matches = sorted(Path(base).glob("Microsoft Visual Studio/2022/*/VC/Auxiliary/Build/vcvars64.bat"))
+        if matches:
+            return matches[-1]
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x1000 | 0x00100000, False, pid)
+    if not handle:
+        return False
+    code = wintypes.DWORD()
+    ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+    kernel32.CloseHandle(handle)
+    return bool(ok) and code.value == STILL_ACTIVE
+
+
+def _run_elevated(executable: str, parameters: str, cwd: Path, wait_ms: int | None = None) -> dict:
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS
+    sei.lpVerb = "runas"
+    sei.lpFile = executable
+    sei.lpParameters = parameters
+    sei.lpDirectory = str(cwd)
+    sei.nShow = 0
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessId.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        err = ctypes.get_last_error()
+        if err == ERROR_CANCELLED:
+            return {"status": "elevation_cancelled", "hint": "The UAC prompt was declined."}
+        return {"status": "launch_failed", "error": f"ShellExecuteExW failed (WinError {err})"}
+
+    pid = kernel32.GetProcessId(sei.hProcess) if sei.hProcess else None
+    result: dict = {"status": "started", "pid": pid}
+    if wait_ms is not None and sei.hProcess:
+        wait_result = kernel32.WaitForSingleObject(sei.hProcess, wait_ms)
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code)):
+            result["exit_code"] = code.value
+        result["timed_out"] = wait_result == WAIT_TIMEOUT
+    if sei.hProcess:
+        kernel32.CloseHandle(sei.hProcess)
+    return result
 
 
 class Config:
@@ -71,6 +220,11 @@ class Config:
 
         self.output_dir = self.root / "output"
         self.log_file = self.root / "comfyui_runner.log"
+        self.launch_state = self.root / "user" / "comfyui_runner.launch.json"
+        self.launch_script = self.root / "user" / "comfyui_runner_launch.bat"
+        self.vsdev = _env_flag("COMFYUI_VSDEV", True)
+        self.admin = _env_flag("COMFYUI_ADMIN", False)
+        self.vcvars = _find_vcvars64() if (os.name == "nt" and self.vsdev) else None
 
 
 _config: Config | None = None
@@ -134,9 +288,9 @@ def resolve_port() -> int | None:
 def require_port() -> int:
     port = resolve_port()
     if port is None:
-        raise RuntimeError(
-            "ComfyUI is not running (no responsive port in 8188-8190). Use comfyui_restart first."
-        )
+        cfg = config()
+        where = f"port {cfg.port_override}" if cfg.port_override else "ports 8188-8190"
+        raise RuntimeError(f"ComfyUI is not running (no responsive {where}). Use comfyui_restart first.")
     return port
 
 
@@ -186,12 +340,12 @@ def summarize_history(history_entry: dict, prompt_id: str) -> dict:
     status = history_entry.get("status") or {}
     completed = bool(status.get("completed"))
     status_str = str(status.get("status_str", "success"))
-    if not completed:
-        state = "running"
-    elif status_str == "error":
+    if status_str == "error":
         state = "error"
-    else:
+    elif completed:
         state = "completed"
+    else:
+        state = "running"
     return {
         "status": state,
         "prompt_id": prompt_id,
@@ -310,7 +464,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "workflow_json": {
-                    "type": "string",
+                    "anyOf": [{"type": "string"}, {"type": "object"}],
                     "description": "Workflow object or JSON string in ComfyUI API format",
                 },
                 "wait": {"type": "boolean", "description": "Wait for completion", "default": True},
@@ -478,6 +632,7 @@ async def _comfyui_status(_: dict) -> dict:
         for device in stats.get("devices") or []
     ]
     queue = _queue_prompt_ids(port)
+    launch = _read_launch_state(cfg)
     return {
         "status": "running",
         "port": port,
@@ -486,6 +641,8 @@ async def _comfyui_status(_: dict) -> dict:
         "pytorch": system.get("pytorch_version"),
         "argv": system.get("argv") or [],
         "devices": devices,
+        "admin_launch": bool(launch.get("admin")),
+        "vsdev": launch.get("vsdev"),
         "queue": {
             "running": sum(1 for state in queue.values() if state == "running"),
             "pending": sum(1 for state in queue.values() if state == "pending"),
@@ -494,9 +651,86 @@ async def _comfyui_status(_: dict) -> dict:
     }
 
 
-def _find_comfyui_pids(ports: set[int]) -> dict[int, str]:
+def _cmd_arg(value: str) -> str:
+    if value and not any(ch in value for ch in ' \t"&|<>^()'):
+        return value
+    return f'"{value}"'
+
+
+def _launch_script(cfg: Config, start_args: list[str]) -> Path:
+    python_cmd = " ".join([f'"{cfg.python}"', "main.py", *[_cmd_arg(arg) for arg in start_args]])
+    lines = ["@echo off", f'cd /d "{cfg.root}"']
+    if cfg.vcvars is not None:
+        lines.append(f'call "{cfg.vcvars}" >nul 2>&1')
+    lines.append('set "PYTHONUTF8=1"')
+    lines.append(f'{python_cmd} > "{cfg.log_file}" 2>&1')
+    cfg.launch_script.parent.mkdir(parents=True, exist_ok=True)
+    cfg.launch_script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cfg.launch_script
+
+
+def _write_launch_state(cfg: Config, pid: int, port: int, script: Path) -> str | None:
+    try:
+        cfg.launch_state.parent.mkdir(parents=True, exist_ok=True)
+        cfg.launch_state.write_text(
+            json.dumps(
+                {
+                    "pid": pid,
+                    "port": port,
+                    "admin": cfg.admin,
+                    "vsdev": str(cfg.vcvars) if cfg.vcvars else None,
+                    "script": str(script),
+                    "started_at": round(time.time(), 3),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _read_launch_state(cfg: Config) -> dict:
+    try:
+        data = json.loads(cfg.launch_state.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clear_launch_state(cfg: Config) -> None:
+    try:
+        cfg.launch_state.unlink()
+    except OSError:
+        pass
+
+
+def _find_comfyui_pids() -> dict[int, str]:
     cfg = config()
     found: dict[int, str] = {}
+    try:
+        import psutil
+    except ImportError:
+        return found
+
+    for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            if not any(Path(arg).name.lower() == "main.py" for arg in cmdline if arg):
+                continue
+            cwd = proc.info.get("cwd") or ""
+            joined = " ".join(cmdline).lower()
+            cwd_matches = bool(cwd) and Path(cwd).resolve() == cfg.root
+            if cwd_matches or str(cfg.root).lower() in joined:
+                found[proc.pid] = "main.py process"
+        except (psutil.Error, OSError):
+            continue
+    return found
+
+
+def _kill_pid(pid: int) -> str:
     try:
         import psutil
     except ImportError:
@@ -504,89 +738,118 @@ def _find_comfyui_pids(ports: set[int]) -> dict[int, str]:
 
     if psutil is not None:
         try:
-            for conn in psutil.net_connections(kind="inet"):
-                if (
-                    conn.status == psutil.CONN_LISTEN
-                    and conn.laddr
-                    and conn.laddr.port in ports
-                    and conn.pid
-                ):
-                    found[conn.pid] = f"port {conn.laddr.port}"
-        except Exception:
-            pass
-        for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
-            try:
-                cmdline = proc.info.get("cmdline") or []
-                if not any(Path(arg).name.lower() == "main.py" for arg in cmdline if arg):
+            proc = psutil.Process(pid)
+            children = proc.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                except psutil.Error:
                     continue
-                cwd = proc.info.get("cwd") or ""
-                joined = " ".join(cmdline).lower()
-                cwd_matches = bool(cwd) and Path(cwd).resolve() == cfg.root
-                if cwd_matches or str(cfg.root).lower() in joined:
-                    found.setdefault(proc.pid, "main.py process")
-            except Exception:
-                continue
-    else:
-        raw = subprocess.run(["netstat", "-ano"], capture_output=True, timeout=15).stdout
-        for line in _decode(raw).splitlines():
-            parts = line.split()
-            if len(parts) < 5 or not parts[-1].isdigit() or "LISTEN" not in line.upper():
-                continue
-            local = parts[1]
-            if ":" not in local:
-                continue
-            try:
-                port = int(local.rsplit(":", 1)[1])
-            except ValueError:
-                continue
-            if port in ports:
-                found[int(parts[-1])] = f"port {port}"
-    return found
+            proc.kill()
+            psutil.wait_procs([proc, *children], timeout=5)
+            return "killed"
+        except psutil.NoSuchProcess:
+            return "gone"
+        except psutil.Error as exc:
+            return str(exc)
 
-
-def _kill_pid(pid: int) -> str:
     if os.name == "nt":
-        proc = subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            capture_output=True,
-            timeout=20,
-        )
+        try:
+            proc = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            return "taskkill timeout"
         output = _decode(proc.stdout + proc.stderr).strip()
         return "killed" if proc.returncode == 0 else output
     os.kill(pid, signal.SIGTERM)
     return "signalled"
 
 
+def _state_process_alive(state: dict) -> bool:
+    pid = int(state.get("pid") or 0)
+    if not pid or not _pid_alive(pid):
+        return False
+    started_at = state.get("started_at")
+    if not started_at:
+        return True
+    try:
+        import psutil
+    except ImportError:
+        return True
+    try:
+        created = psutil.Process(pid).create_time()
+    except psutil.Error:
+        return True
+    return abs(created - float(started_at)) < 300
+
+
 def _stop_comfyui(kill_mcp: bool) -> dict:
     cfg = config()
-    ports = set(DEFAULT_PORTS)
+    state = _read_launch_state(cfg)
+    ports = set()
     if cfg.port_override:
         ports.add(cfg.port_override)
+    if state.get("port"):
+        ports.add(int(state["port"]))
+    if not ports:
+        ports.update(DEFAULT_PORTS)
     if kill_mcp:
         ports.add(9100)
 
-    pids = _find_comfyui_pids(ports)
+    admin_launch = bool(state.get("admin"))
+    state_alive = _state_process_alive(state)
+
+    pids = _find_comfyui_pids()
+    if state_alive:
+        pids = {int(state["pid"]): "launch process"}
+
     killed: list[dict] = []
     failed: list[dict] = []
     for pid, source in pids.items():
         result = _kill_pid(pid)
-        if result == "killed":
+        if result in {"killed", "gone"}:
             killed.append({"pid": pid, "source": source})
-        else:
-            failed.append({"pid": pid, "source": source, "detail": result})
+            continue
+        if admin_launch:
+            elevated = _run_elevated("taskkill.exe", f"/F /T /PID {pid}", cfg.root, wait_ms=20000)
+            if (
+                elevated.get("status") == "started"
+                and not elevated.get("timed_out")
+                and elevated.get("exit_code") == 0
+            ):
+                killed.append({"pid": pid, "source": source, "elevated": True})
+                continue
+            failed.append({"pid": pid, "source": source, "detail": result, "elevated": elevated})
+            continue
+        failed.append({"pid": pid, "source": source, "detail": result})
 
-    deadline = time.monotonic() + 5
-    still_open = []
+    deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
+        remaining = set(_find_comfyui_pids())
+        if _state_process_alive(state):
+            remaining.add(int(state["pid"]))
         still_open = [port for port in ports if _port_open(cfg.host, port, timeout=0.3)]
-        if not still_open:
+        if not remaining and not still_open:
             break
         time.sleep(0.5)
 
+    remaining = set(_find_comfyui_pids())
+    if _state_process_alive(state):
+        remaining.add(int(state["pid"]))
+    still_open = [port for port in ports if _port_open(cfg.host, port, timeout=0.3)]
+    stopped = not remaining and not still_open
+    if not _state_process_alive(state) and not remaining:
+        _clear_launch_state(cfg)
+
     return {
-        "stopped": not still_open,
+        "stopped": stopped,
+        "admin_launch": admin_launch,
         "killed": killed,
         "failed": failed,
+        "remaining": sorted(remaining),
         "ports_still_open": still_open,
     }
 
@@ -603,31 +866,74 @@ async def _comfyui_restart(args: dict) -> dict:
     raw_extra = str(args.get("extra_args", "")).strip()
     start_args = shlex.split(raw_extra) if raw_extra else list(cfg.start_args)
     if not any(arg == "--port" or arg.startswith("--port=") for arg in start_args):
-        start_args += ["--port", str(cfg.port_override or 8189)]
+        start_args += ["--port", str(cfg.port_override or 8188)]
 
-    command = [str(cfg.python), "main.py", *start_args]
-    creation_flags = 0
-    if os.name == "nt":
-        creation_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    port = cfg.port_override or 8188
+    for index, arg in enumerate(start_args):
+        if arg == "--port" and index + 1 < len(start_args):
+            port = int(start_args[index + 1])
+        elif arg.startswith("--port="):
+            port = int(arg.split("=", 1)[1])
 
-    with open(cfg.log_file, "w", encoding="utf-8") as log:
+    if not stop_result["stopped"] and stop_result["failed"]:
+        return {
+            "status": "stop_failed",
+            "port": port,
+            "stop": stop_result,
+            "hint": "ComfyUI could not be stopped. Approve the UAC prompt or stop it manually, then retry.",
+        }
+
+    if _port_open(cfg.host, port):
+        return {
+            "status": "port_busy",
+            "port": port,
+            "stop": stop_result,
+            "hint": "Another process owns this port. Retry with extra_args='--port 8888' or update comfyui_port.",
+        }
+
+    script = _launch_script(cfg, start_args)
+    command_line = f'cmd.exe /d /s /c ""{script}""'
+    if cfg.admin:
+        elevated = _run_elevated("cmd.exe", f'/d /s /c ""{script}""', cfg.root)
+        if elevated.get("status") != "started":
+            return {
+                "status": elevated.get("status", "launch_failed"),
+                "port": port,
+                "stop": stop_result,
+                "script": str(script),
+                "error": elevated.get("error"),
+                "hint": elevated.get("hint"),
+            }
+        pid = int(elevated["pid"])
+    else:
+        creation_flags = 0
+        if os.name == "nt":
+            # A hidden console keeps MKL/Fortran nodes from aborting when the MCP client exits.
+            creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(
-            command,
+            command_line,
             cwd=str(cfg.root),
             stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
             start_new_session=os.name != "nt",
             env={**os.environ, "PYTHONUTF8": "1"},
         )
+        pid = proc.pid
 
+    state_error = _write_launch_state(cfg, pid, port, script)
     return {
         "status": "starting",
-        "pid": proc.pid,
-        "command": " ".join(command),
+        "pid": pid,
+        "port": port,
+        "admin": cfg.admin,
+        "vsdev": str(cfg.vcvars) if cfg.vcvars else None,
+        "script": str(script),
+        "command": command_line,
         "log_file": str(cfg.log_file),
         "stop": stop_result,
+        "state_error": state_error,
         "hint": "Poll comfyui_status until status is running.",
     }
 

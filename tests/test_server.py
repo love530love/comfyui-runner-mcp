@@ -52,6 +52,17 @@ def test_summarize_history_completed_and_error():
     assert failed["status"] == "error"
     assert failed["messages"] == [["execution_error"]]
 
+    interrupted = server.summarize_history(
+        {"status": {"completed": False, "status_str": "error", "messages": [["execution_error"]]}},
+        "pid-3",
+    )
+    assert interrupted["status"] == "error"
+
+    running = server.summarize_history(
+        {"status": {"completed": False, "status_str": "success"}, "outputs": {}}, "pid-4"
+    )
+    assert running["status"] == "running"
+
 
 def test_normalize_workflow_accepts_json_string_and_object():
     object_form = {"1": {"class_type": "SaveImage", "inputs": {}}}
@@ -74,6 +85,7 @@ def test_config_reads_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("COMFYUI_PORT", "8199")
     monkeypatch.setenv("COMFYUI_START_ARGS", "--port 8199 --use-pytorch-cross-attention")
     monkeypatch.setenv("COMFYUI_PYTHON", sys.executable)
+    monkeypatch.setenv("COMFYUI_VSDEV", "0")
     server._config = None
 
     cfg = server.config()
@@ -81,6 +93,27 @@ def test_config_reads_environment(tmp_path, monkeypatch):
     assert cfg.port_override == 8199
     assert cfg.start_args == ["--port", "8199", "--use-pytorch-cross-attention"]
     assert cfg.output_dir == tmp_path.resolve() / "output"
+    server._config = None
+
+
+def test_launch_script_sets_cwd_vsdev_and_python(tmp_path, monkeypatch):
+    (tmp_path / "main.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("COMFYUI_DIR", str(tmp_path))
+    monkeypatch.setenv("COMFYUI_PYTHON", sys.executable)
+    monkeypatch.setenv("COMFYUI_VSDEV", "0")
+    server._config = None
+
+    cfg = server.config()
+    cfg.log_file = tmp_path / "run.log"
+    cfg.launch_script = tmp_path / "launch.bat"
+    cfg.vcvars = tmp_path / "vcvars64.bat"
+    script = server._launch_script(cfg, ["--port", "8888"])
+    text = script.read_text(encoding="utf-8")
+
+    assert f'cd /d "{tmp_path.resolve()}"' in text
+    assert 'call "' in text and "vcvars64.bat" in text
+    assert "main.py --port 8888" in text
+    assert f'"{sys.executable}"' in text
     server._config = None
 
 
